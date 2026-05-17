@@ -19,23 +19,15 @@
 
 在你的 Ubuntu / Debian 服务器上，以 `root` 权限执行以下单行命令即可直接冲浪：
 
-\`\`\`bash
+```bash
+bash <(curl -sL tcp.vpsing.de)
+```
+或者使用 GitHub 原生 Raw 链接（国内 VPS 可能会有延迟或超时）：
+```bash
 bash <(curl -sL https://raw.githubusercontent.com/666shen/tcp-dashboard/main/tcp.sh)
-或者
-bash <(curl -sL https://tcp.vpsing.de)
-\`\`\`
-
+```
 > *提示：脚本首次运行会自动将其物理安装至系统，并贴心地生成本地快捷命令 `t`。以后在任意路径直接输入 `t` 即可秒开看板。*
 
-## 🛠️ 深度看板预览
-
-\`\`\`text
->>> 正在向 Linux 内核注入跨境物理链路专项优化补丁...
-  [*] Analyzing Network Topo...       ■■■■■ [ OK ]
-  [*] Clamping MSS Window...          ■■■■■ [ OK ]
-  [*] Expanding UDP Ring Buffer...    ■■■■■ [ OK ]
-  [*] Activating ECN Engine...        ■■■■■ [ OK ]
-\`\`\`
 
 ## ⚖️ 开源协议
 
