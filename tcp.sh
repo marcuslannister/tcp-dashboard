@@ -162,6 +162,11 @@ restore_managed_file() {
     fi
 }
 
+# Extract sysctl keys (left-hand side of `key = value`) from a config file.
+config_keys() {
+    awk -F= '/^[[:space:]]*[a-z]/ {gsub(/[[:space:]]/, "", $1); print $1}' "$1"
+}
+
 snapshot_sysctls() {
     local config="$1" key value
     ensure_state_dir
@@ -169,18 +174,62 @@ snapshot_sysctls() {
     while IFS= read -r key; do
         grep -qF "${key}"$'\t' "$SYSCTL_STATE" && continue
         value=$(sysctl -n "$key" 2>/dev/null) || continue
+        # Flatten multi-value sysctls (sysctl -n is tab-separated) to spaces so the
+        # snapshot stays a clean key<TAB>value record and restores cleanly via sysctl -w.
+        value=${value//$'\t'/ }
         printf '%s\t%s\n' "$key" "$value" >>"$SYSCTL_STATE"
-    done < <(awk -F= '/^[[:space:]]*[a-z]/ {gsub(/[[:space:]]/, "", $1); print $1}' "$config")
+    done < <(config_keys "$config")
 }
 
 restore_sysctls() {
     local key value failed=0
     [ -e "$SYSCTL_STATE" ] || return 0
     while IFS=$'\t' read -r key value; do
-        sysctl -w "$key=$value" >/dev/null || failed=1
+        sysctl -w "$key=$value" >/dev/null 2>&1 || failed=1
     done <"$SYSCTL_STATE"
     [ "$failed" -eq 0 ] || return 1
     rm -f "$SYSCTL_STATE"
+}
+
+# Restore live kernel values for only the keys declared in <config>, then drop
+# them from the snapshot so a later full rollback won't touch them again.
+restore_sysctl_keys() {
+    local config="$1" key value
+    [ -e "$SYSCTL_STATE" ] || return 0
+    while IFS= read -r key; do
+        value=$(awk -F'\t' -v k="$key" '$1==k {sub(/^[^\t]*\t/, ""); print; exit}' "$SYSCTL_STATE")
+        [ -n "$value" ] && sysctl -w "$key=$value" >/dev/null 2>&1
+        if grep -qF "${key}"$'\t' "$SYSCTL_STATE"; then
+            grep -vF "${key}"$'\t' "$SYSCTL_STATE" >"$SYSCTL_STATE.tmp" && mv "$SYSCTL_STATE.tmp" "$SYSCTL_STATE"
+        fi
+    done < <(config_keys "$config")
+    [ -s "$SYSCTL_STATE" ] || rm -f "$SYSCTL_STATE"
+}
+
+# Undo a single managed sysctl drop-in: revert its live values, then its file.
+revert_managed_sysctl() {
+    local path="$1" name="$2"
+    restore_sysctl_keys "$path"
+    restore_managed_file "$path" "$name"
+}
+
+# Restore the RPS /sys files and global flow table this script changed.
+revert_rps() {
+    local state_path state_value rc=0
+    if [ -f "$RPS_STATE" ]; then
+        while IFS=$'\t' read -r state_path state_value; do
+            [ ! -f "$state_path" ] || printf '%s\n' "$state_value" >"$state_path" 2>/dev/null || rc=1
+        done <"$RPS_STATE"
+        [ "$rc" -eq 0 ] && rm -f "$RPS_STATE"
+    fi
+    if [ -f "$RPS_SOCK_FLOW_STATE" ]; then
+        if sysctl -w "net.core.rps_sock_flow_entries=$(cat "$RPS_SOCK_FLOW_STATE")" >/dev/null 2>&1; then
+            rm -f "$RPS_SOCK_FLOW_STATE"
+        else
+            rc=1
+        fi
+    fi
+    return "$rc"
 }
 
 network_interfaces() {
@@ -228,7 +277,7 @@ EOF
     if [ $? -ne 0 ]; then restore_managed_file "$BBR_OPT" bbr-config; return 1; fi
     snapshot_sysctls "$BBR_OPT"
     if ! sysctl -p "$BBR_OPT"; then
-        rollback_tcp_tune
+        revert_managed_sysctl "$BBR_OPT" bbr-config
         echo -e "${RED}BBR 配置应用失败，请检查上方错误。${NC}"
         read -r -p "按回车返回..."
         return 1
@@ -307,10 +356,7 @@ EOF
     if [ $? -ne 0 ]; then restore_managed_file "$SYSCTL_OPT" network-config; return 1; fi
     snapshot_sysctls "$SYSCTL_OPT"
     if ! sysctl -p "$SYSCTL_OPT"; then
-        rollback_tcp_tune
-        echo -e "${RED}部分内核参数不受当前系统支持，请检查上方错误。${NC}"
-        read -r -p "按回车返回..."
-        return 1
+        echo -e "${YELLOW}部分内核参数不受当前系统支持，已跳过；其余参数已应用。${NC}"
     fi
 
     echo -e "\n${GREEN}✅ 网络参数已应用：${NC}"
@@ -338,16 +384,14 @@ EOF
 
     if command -v iptables &>/dev/null; then
         ensure_state_dir
-        if ! iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-            if iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; then
-                : >"$MSS_RULE_ADDED"
-            else
-                echo -e "${RED}MSS Clamp 规则添加失败。${NC}"
-                rollback_tcp_tune
-                return 1
-            fi
+        if iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+            echo -e "${GREEN}  ✔ MSS Clamp 规则已存在。${NC}"
+        elif iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; then
+            : >"$MSS_RULE_ADDED"
+            echo -e "${GREEN}  ✔ 已部署 MSS Clamp 规则。${NC}"
+        else
+            echo -e "${YELLOW}MSS Clamp 规则添加失败，已跳过；其余参数已应用。${NC}"
         fi
-        echo -e "${GREEN}  ✔ MSS Clamp 规则已存在。${NC}"
     fi
 
 	# ======= 【新加入的代码】=======
@@ -397,12 +441,12 @@ optimize_nic_tune() {
         mv "$RPS_SOCK_FLOW_STATE.tmp" "$RPS_SOCK_FLOW_STATE"
     fi
     for eth in "${interfaces[@]}"; do
-        for rps_file in "/sys/class/net/$eth"/queues/rx-*/rps_cpus; do [ ! -f "$rps_file" ] || echo "$rps_cpus" >"$rps_file" || { rollback_tcp_tune; return 1; }; done
-        for rfc_file in "/sys/class/net/$eth"/queues/rx-*/rps_flow_cnt; do [ ! -f "$rfc_file" ] || echo "4096" >"$rfc_file" || { rollback_tcp_tune; return 1; }; done
+        for rps_file in "/sys/class/net/$eth"/queues/rx-*/rps_cpus; do [ ! -f "$rps_file" ] || echo "$rps_cpus" >"$rps_file" || { revert_rps; return 1; }; done
+        for rfc_file in "/sys/class/net/$eth"/queues/rx-*/rps_flow_cnt; do [ ! -f "$rfc_file" ] || echo "4096" >"$rfc_file" || { revert_rps; return 1; }; done
     done
     if ! sysctl -w net.core.rps_sock_flow_entries=32768; then
         echo -e "${RED}RPS 全局流表配置失败。${NC}"
-        rollback_tcp_tune
+        revert_rps
         return 1
     fi
     echo -e "\n${GREEN}✅ RPS 配置已应用：${NC}"
@@ -423,8 +467,23 @@ set_ipv4_priority() {
             : >"$GAI_CREATED"
         fi
     fi
+    # When no gai.conf exists, write the full glibc default table (with the IPv4
+    # entry promoted to top precedence). Specifying any precedence line replaces
+    # the built-in table entirely, so the lone IPv4 line would wipe the defaults
+    # for ::1, 6to4, etc.
     if [ ! -f /etc/gai.conf ]; then
-        : >/etc/gai.conf
+        cat >/etc/gai.conf <<'EOF'
+label  ::1/128       0
+label  ::/0          1
+label  2002::/16     2
+label  ::/96         3
+label  ::ffff:0:0/96 4
+precedence  ::1/128       50
+precedence  ::/0          40
+precedence  2002::/16     30
+precedence  ::/96         20
+precedence  ::ffff:0:0/96  100
+EOF
     fi
 
     if ! grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' /etc/gai.conf; then
@@ -432,37 +491,35 @@ set_ipv4_priority() {
     fi
 
     echo -e "\n${GREEN}✅ 优化成功！当前系统已设置为 [ IPv4 优先 ]。${NC}"
-    read -p "按回车返回..."
+    read -r -p "按回车返回..."
 }
 
 rollback_tcp_tune() {
-    local state_path state_value failed=0
+    local failed=0
     restore_managed_file "$SYSCTL_OPT" network-config || failed=1
     restore_managed_file "$LIMITS_OPT" limits-config || failed=1
     restore_managed_file "$BBR_OPT" bbr-config || failed=1
 
     if [ -f "$GAI_BACKUP" ]; then
-        cp -p "$GAI_BACKUP" /etc/gai.conf && rm -f "$GAI_BACKUP" || failed=1
+        if cp -p "$GAI_BACKUP" /etc/gai.conf; then rm -f "$GAI_BACKUP" "$GAI_CREATED"; else failed=1; fi
     elif [ -f "$GAI_CREATED" ]; then
-        rm -f /etc/gai.conf || failed=1
+        # Only remove gai.conf if it still carries our marker; an administrator may
+        # have legitimately recreated it after we set the .created marker.
+        if grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' /etc/gai.conf 2>/dev/null; then
+            rm -f /etc/gai.conf || failed=1
+        fi
+        rm -f "$GAI_CREATED"
     fi
-    [ "$failed" -ne 0 ] || rm -f "$GAI_CREATED"
 
     if command -v iptables &>/dev/null && [ -f "$MSS_RULE_ADDED" ]; then
         if iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; then rm -f "$MSS_RULE_ADDED"; else failed=1; fi
     fi
 
-    if [ -f "$RPS_STATE" ]; then
-        while IFS=$'\t' read -r state_path state_value; do
-            [ ! -f "$state_path" ] || printf '%s\n' "$state_value" >"$state_path" || failed=1
-        done <"$RPS_STATE"
-        [ "$failed" -ne 0 ] || rm -f "$RPS_STATE"
-    fi
-    if [ -f "$RPS_SOCK_FLOW_STATE" ]; then
-        if sysctl -w "net.core.rps_sock_flow_entries=$(cat "$RPS_SOCK_FLOW_STATE")"; then rm -f "$RPS_SOCK_FLOW_STATE"; else failed=1; fi
-    fi
+    revert_rps || failed=1
 
-    sysctl --system || failed=1
+    # Best-effort reload of remaining system config; its exit status reflects
+    # unrelated drop-ins, so it must not fail the rollback.
+    sysctl --system >/dev/null 2>&1 || true
     restore_sysctls || failed=1
     if [ "$failed" -ne 0 ]; then
         echo -e "${RED}回退未完全成功；恢复状态已保留，可重试。${NC}"
@@ -482,7 +539,7 @@ fi
 while true; do
     # --- 实时动态状态检测 ---
     # 1. 检测 IPv4 优先状态
-    if [ -f /etc/gai.conf ] && grep -q "^precedence ::ffff:0:0/96  100" /etc/gai.conf; then
+    if [ -f /etc/gai.conf ] && grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' /etc/gai.conf; then
         status_ipv4="${GREEN}[已激活]${NC}"
     else
         status_ipv4="${RED}[未开启]${NC}"
@@ -533,7 +590,7 @@ while true; do
     2) enable_bbr_tune ;;
     3) smart_tune_tcp_tune ;;
     4) optimize_nic_tune ;;
-    5) rollback_tcp_tune && read -p "按回车返回..." ;;
+    5) rollback_tcp_tune; read -r -p "按回车返回..." ;;
     6) uninstall_script ;;
     0) exit 0 ;;
     *) echo -e "${RED}输入错误，请输入正确数字！${NC}" && sleep 1 ;;

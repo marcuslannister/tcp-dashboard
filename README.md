@@ -1,7 +1,7 @@
 # 🚀 TCP/UDP Network Deep Optimizer & Dashboard
 
 一个用于配置 Linux TCP、UDP 与 RPS 参数的交互式网络调优面板。
-支持一键管道流远程运行，并显示实际应用的内核参数。
+需先将脚本下载到本地再运行；运行后显示实际应用的内核参数。
 
 ## ✨ 核心特性
 
