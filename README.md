@@ -16,7 +16,7 @@
 在你的 Ubuntu / Debian 服务器上，先下载脚本到本地文件，再以 `root` 权限执行：
 
 ```bash
-curl -fsSLo tcp.sh https://raw.githubusercontent.com/666shen/tcp-dashboard/main/tcp.sh
+curl -fsSLo tcp.sh https://raw.githubusercontent.com/marcuslannister/tcp-dashboard/refs/heads/main/tcp.sh
 sudo bash ./tcp.sh
 ```
 > *提示：脚本首次运行会复制当前本地文件至系统；通过管道或进程替换直接运行的方式不会自动安装。仅当 `t` 未被占用时创建快捷命令。*
